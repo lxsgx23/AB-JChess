@@ -7,7 +7,7 @@ AB-JChess is a free, open-source UCI engine for **Jieqi** (also known as "uncove
 ## Features
 
 - **NNUE Evaluation** — uses an efficiently updatable neural network (NNUE) for fast, accurate position assessment, following the approach pioneered by Stockfish and Pikafish.
-- **UCI Protocol** — compatible with any UCI-capable GUI (e.g., [JieqiBox](https://github.com/Velithia/JieqiBox), a dedicated Jieqi GUI that supports Pikafish-protocol engines).
+- **UCI Protocol** — compatible with any UCI-capable GUI.
 - **V8.2 NNUE Trainer** — includes a PyTorch-based training pipeline with feature encoding, distributed training support, checkpoint validation, and runtime serialization.
 - **Configurable EvalFile** — you can load custom NNUE network files at runtime via the `EvalFile` UCI option.
 - **Cross-platform** — builds on Windows, Linux, and macOS.
