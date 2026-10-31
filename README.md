@@ -35,8 +35,7 @@ go movetime 5000
 
 FEN 采用 Pikafish 揭棋分支的格式（`X`/`x` 表示暗子）。验证：`bench` 应输出 `Nodes searched: 43125`。
 
-> 发布包 AB-JChess-20261031 中的可执行文件名为 `jqe-*`，强制档位的环境变量为 `JQE_TIER`；
-> 从本源码编译得到的是 `abjchess-*` 与 `ABJ_TIER`，引擎行为相同。
+> 发布包 AB-JChess-20261031 中的可执行文件由本源码编译，文件名为 `abjchess-*`，强制档位的环境变量为 `ABJ_TIER`。
 
 ## 编译
 
