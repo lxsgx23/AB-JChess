@@ -1,7 +1,7 @@
 # ABJchess 网络训练器
 
 训练 ABJchess 使用的 HNN 小网络（文件格式 JQHNNUE1）的 PyTorch 训练器，是训练 `abjchess-20261030.nnue`
-所用的训练器版本（仅移除了内部注释，代码未改动）。
+所用的训练器版本（移除了内部注释；另外 `--teacher` 现在可直接使用发布的小网，见下文，其余代码未改动）。
 
 ## 文件
 
@@ -36,10 +36,14 @@ pip install -r requirements.txt
 2. **训练**：
 
    ```sh
-   python3 train_hnn.py data1.bin data2.bin ... --val-file val.bin --teacher TEACHER.nnue --out runs/mynet
+   python3 train_hnn.py data1.bin data2.bin ... --val-file val.bin --teacher abjchess-20261030.nnue --out runs/mynet
    ```
 
-   - `--teacher`（必填）：ABJNNUE 格式的教师网络；目标为 `wt*教师值 + ws*搜索分 + wr*对局结果`（在胜率空间，权重由 `--wt/--ws/--wr` 指定）。
+   - `--teacher`：教师网络，可直接使用发布包中的小网 `abjchess-20261030.nnue`（压缩格式会自动用 `../abjchess/tools/jqnz_tool.cpp`
+     编译出的工具解压，需要 g++；也可用环境变量 `ABJ_JQNZ_TOOL` 指定已编译的 `jqnz_tool`，或直接给出解压后的 `.hnn`）。
+     教师值用与引擎逐位一致的整数推理（`hnn_ref.py`，CPU）计算。也接受 ABJNNUE 格式的大网（`--init-ls` 只支持大网）。
+   - 目标为 `wt*教师值 + ws*搜索分 + wr*对局结果`（在胜率空间，权重由 `--wt/--ws/--wr` 指定）；`--wt 0` 时可以不给 `--teacher`。
+   - 没有 GPU 时加 `--device cpu`（仅适合小规模试验）。
    - 网络结构：`--width`（FT 宽度）、`--kb-scheme`、`--l1/--l2`、`--stack-scheme`、`--factor`。
    - 训练过程：`--epochs`、`--lr`、`--batch`、`--qat-from`、`--stream N`（数据大于内存时分块流式读取）等，完整列表见 `python3 train_hnn.py -h`。
 

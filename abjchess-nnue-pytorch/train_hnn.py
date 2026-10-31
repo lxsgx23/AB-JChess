@@ -3,7 +3,9 @@
 Train an HNN small net (engine/src/hnnue.h): the cheap it014-style inputs (king-bucketed piece-square features +
 30 urn thresholds, no face-down variant doubling) with the ABJ/SNN head (pairwise FT product, 16 layer stacks by
 piece count x face-down pieces, W -> 16 -> [sqr, crelu] -> 32 -> 1 + skip, 16-bucket PSQT, ABJ post-processing).
-Optional teacher target from an ABJNNUE big net exactly like train_snn.py (same target, loss, schedule, QAT).
+Optional teacher target (same target, loss, schedule, QAT as train_snn.py). The teacher is an HNN small net (e.g. the released
+abjchess-20261030.nnue, decompressed automatically with abjchess/tools/jqnz_tool) or an ABJNNUE big-net package;
+with --wt 0 it may be omitted.
 
 Input pipeline options (non-stream mode):
   --threads N   torch CPU threads (default 4)
@@ -13,7 +15,7 @@ Input pipeline options (non-stream mode):
   --tv-cache F  teacher values cached to disk (F.npy + F.json key: data files/sizes/mtimes, teacher, filters)
   loss summed on the GPU in float64 (identical to summing loss.item()), no per-step host sync.
 
-  python3 train_hnn.py DATA.bin ... --val-file VAL.bin --teacher TEACHER.nnue --width 256 --kb-scheme 2 \
+  python3 train_hnn.py DATA.bin ... --val-file VAL.bin --teacher abjchess-20261030.nnue --width 256 --kb-scheme 2 \
       --init-ls [--factor] --epochs 4 --out runs/hnn256s2
 
 --kb-scheme: 0 no king buckets, 1 three by king file, 2 two (king on the centre file or not) + mirror,
@@ -465,12 +467,63 @@ def load_records_gpu(paths, max_records, keep_captures, dev, min_ply=0):
     return out, total
 
 
+
+# ---------------------------------------------------------------- teacher loading (HNN small net or ABJNNUE big net)
+HNN_MAGIC, JQNZ_MAGICS = b"JQHNNUE1", (b"JQHNNZ01", b"JQHNNL01")
+
+
+def jqnz_decode(path):
+    """Decompress a JQHNNZ01 / JQHNNL01 net (e.g. abjchess-20261030.nnue) to a temporary .hnn with abjchess/tools/jqnz_tool.
+    The tool is taken from $ABJ_JQNZ_TOOL, from PATH, or compiled from ../abjchess/tools/jqnz_tool.cpp ($CXX, default g++)."""
+    import shutil, subprocess, tempfile
+    here = Path(__file__).resolve().parent
+    tmp = Path(tempfile.mkdtemp(prefix="abj_teacher_"))
+    tool = os.environ.get("ABJ_JQNZ_TOOL") or shutil.which("jqnz_tool")
+    if not tool:
+        src = here.parent / "abjchess" / "tools" / "jqnz_tool.cpp"
+        if not src.exists():
+            raise SystemExit(f"{path}: compressed net; set ABJ_JQNZ_TOOL to a built jqnz_tool or pass the decoded .hnn")
+        tool = str(tmp / "jqnz_tool")
+        subprocess.run([os.environ.get("CXX", "g++"), "-std=c++20", "-O2", f"-I{here.parent / 'abjchess' / 'src'}", str(src),
+                        "-o", tool], check=True)
+    out = tmp / "teacher.hnn"
+    subprocess.run([tool, "d", str(path), str(out)], check=True, stdout=subprocess.DEVNULL)
+    return out
+
+
+class HnnTeacher:
+    """HNN small net as the teacher: exact integer engine inference (hnn_ref, CPU) of the raw records."""
+
+    def __init__(self, path, dev):
+        self.net, self.dev = HR.Net(str(path)), dev
+
+    @torch.no_grad()
+    def __call__(self, b):
+        rec = b.cpu().numpy() if torch.is_tensor(b) else b
+        return torch.from_numpy(HR.evaluate(self.net, rec)[2].astype(np.float32)).to(self.dev)
+
+
+def load_teacher(args, dev):
+    if not args.teacher:
+        assert args.wt == 0 and args.wt_end in (None, 0) and not args.init_ls, \
+            "--teacher is required unless --wt 0 (no --wt-end, no --init-ls); e.g. --teacher abjchess-20261030.nnue"
+        print("no teacher (--wt 0)", flush=True)
+        return None
+    magic = open(args.teacher, "rb").read(8)
+    if magic in JQNZ_MAGICS or magic == HNN_MAGIC:
+        assert not args.init_ls, "--init-ls needs an ABJNNUE big-net teacher"
+        path = jqnz_decode(args.teacher) if magic in JQNZ_MAGICS else args.teacher
+        t = HnnTeacher(path, dev)
+        print(f"teacher: HNN small net {args.teacher}", flush=True)
+        return t
+    return S.Teacher(args.teacher, dev)  # ABJNNUE big-net package
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("data", nargs="+")
     ap.add_argument("--val-file", required=True)
     ap.add_argument("--val-max", type=int, default=500_000)
-    ap.add_argument("--teacher", required=True)
+    ap.add_argument("--teacher", default="", help="teacher net: an HNN small net (.hnn, or a compressed .nnue/.jqz such as the released abjchess-20261030.nnue) or an ABJNNUE big-net package; may be omitted when --wt 0 (and no --init-ls)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--width", type=int, default=256)
     ap.add_argument("--kb-scheme", type=int, default=2, choices=[0, 1, 2, 3])
@@ -574,21 +627,26 @@ def main():
     sfeat = S.Featurizer(dev)
     hfeat = HFeaturizer(dev, args.kb_scheme)
     tfeat = JT.ThreatFeaturizer(dev)
-    teacher = S.Teacher(args.teacher, dev)
+    teacher = load_teacher(args, dev)
 
     def teach(data):
-        outv = torch.empty(len(data), dtype=torch.float32, device=dev)
+        outv = torch.zeros(len(data), dtype=torch.float32, device=dev)
+        if teacher is None:  # --wt 0 without --teacher: the teacher term has weight 0
+            return outv
         for i in range(0, len(data), 32768):
             b = data[i:i + 32768].to(dev)
-            fe, _, bu, po = sfeat(b)
-            outv[i:i + len(b)] = teacher(fe, bu, po.double()).float()
+            if isinstance(teacher, HnnTeacher):
+                outv[i:i + len(b)] = teacher(b)
+            else:
+                fe, _, bu, po = sfeat(b)
+                outv[i:i + len(b)] = teacher(fe, bu, po.double()).float()
         return outv
     tv_train = None
     if len(host) and not args.stream:
         key = None
         if args.tv_cache:
             key = json.dumps(dict(data=[(os.path.abspath(p), os.path.getsize(p), int(os.path.getmtime(p))) for p in args.data],
-                                  teacher=(os.path.abspath(args.teacher), os.path.getsize(args.teacher)), n=len(host),
+                                  teacher=(os.path.abspath(args.teacher), os.path.getsize(args.teacher)) if args.teacher else None, n=len(host),
                                   keep_captures=args.keep_captures, max_records=args.max_records), sort_keys=True)
             cf, cj = args.tv_cache + ".npy", args.tv_cache + ".json"
             if os.path.exists(cf) and os.path.exists(cj) and open(cj).read() == key:
