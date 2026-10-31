@@ -1,8 +1,2 @@
-# Validated: CPython 3.13.3, NVIDIA driver supporting CUDA 12.4.
---extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.6.0+cu124
-pytorch-lightning==1.9.5
-numpy==2.2.6
-cupy-cuda12x==14.0.1
-tensorboard==2.20.0
-pytest==9.1.1
+numpy
+torch

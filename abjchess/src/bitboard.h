@@ -1,13 +1,17 @@
 /*
+  ABJchess (AB JChess), a UCI Jieqi engine.
+  Contains code derived from AB-JChess / Pikafish / Stockfish:
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
   Copyright (C) 2004-2025 The Stockfish developers (see AUTHORS file)
+  Based on jqe, Copyright (c) 2026 Devin O'Keefe (MIT licence, see abjchess/LICENSE-jqe-MIT.txt).
+  See THIRD_PARTY_NOTICES.md at the repository root.
 
-  Stockfish is free software: you can redistribute it and/or modify
+  This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
   the Free Software Foundation, either version 3 of the License, or
   (at your option) any later version.
 
-  Stockfish is distributed in the hope that it will be useful,
+  This program is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   GNU General Public License for more details.
@@ -15,360 +19,195 @@
   You should have received a copy of the GNU General Public License
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-
-#ifndef BITBOARD_H_INCLUDED
-#define BITBOARD_H_INCLUDED
-
-#include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <cstring>
-#include <cstdint>
-#include <cstdlib>
-#include <string>
-
+// 128-bit bitboards for the 9x10 Jieqi board (Pikafish-style layout: square s = rank * 9 + file is bit s,
+// rank 0 = Red's home rank, file 0 = file 'a'). Shared, engine-independent layer: geometry masks and ray /
+// leaper attack helpers only; Position keeps byColor / byRole / dark sets on top of it.
+//
+// Jieqi rules encoded here (identical to ABJchess's mailbox movegen in position.cpp):
+//   * a face-down (dark) piece moves by the role of the start square it stands on (T.darkRole);
+//   * a face-down advisor may only step into its own palace, a face-down elephant only within its own half;
+//   * revealed advisors / elephants roam the whole board (no palace / river limit);
+//   * soldiers move forward, sideways once across the river; cannons capture over exactly one screen;
+//   * horse legs and elephant eyes block.
+#pragma once
+#include "tables.h"
 #include "types.h"
 
-#ifdef USE_PEXT
-    #define IF_NOT_PEXT(...)
-#else
-    #define IF_NOT_PEXT(...) __VA_ARGS__
+#include <cstdint>
+#include "jqu128.h"
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
 #endif
 
-namespace Stockfish {
+namespace jq {
 
-namespace Bitboards {
+using Bitboard = jq_u128;
 
-void        init();
-std::string pretty(Bitboard b);
-
-}  // namespace Stockfish::Bitboards
-
-constexpr Bitboard Palace = Bitboard(0x70381CULL) << 64 | Bitboard(0xE07038ULL);
-
-constexpr Bitboard FileABB = Bitboard(0x20100ULL) << 64 | Bitboard(0x8040201008040201ULL);
-constexpr Bitboard FileBBB = FileABB << 1;
-constexpr Bitboard FileCBB = FileABB << 2;
-constexpr Bitboard FileDBB = FileABB << 3;
-constexpr Bitboard FileEBB = FileABB << 4;
-constexpr Bitboard FileFBB = FileABB << 5;
-constexpr Bitboard FileGBB = FileABB << 6;
-constexpr Bitboard FileHBB = FileABB << 7;
-constexpr Bitboard FileIBB = FileABB << 8;
-
-constexpr Bitboard Rank0BB = 0x1FF;
-constexpr Bitboard Rank1BB = Rank0BB << (FILE_NB * 1);
-constexpr Bitboard Rank2BB = Rank0BB << (FILE_NB * 2);
-constexpr Bitboard Rank3BB = Rank0BB << (FILE_NB * 3);
-constexpr Bitboard Rank4BB = Rank0BB << (FILE_NB * 4);
-constexpr Bitboard Rank5BB = Rank0BB << (FILE_NB * 5);
-constexpr Bitboard Rank6BB = Rank0BB << (FILE_NB * 6);
-constexpr Bitboard Rank7BB = Rank0BB << (FILE_NB * 7);
-constexpr Bitboard Rank8BB = Rank0BB << (FILE_NB * 8);
-constexpr Bitboard Rank9BB = Rank0BB << (FILE_NB * 9);
-
-
-constexpr Bitboard PawnFileBB = FileABB | FileCBB | FileEBB | FileGBB | FileIBB;
-constexpr Bitboard HalfBB[2]  = {Rank0BB | Rank1BB | Rank2BB | Rank3BB | Rank4BB,
-                                 Rank5BB | Rank6BB | Rank7BB | Rank8BB | Rank9BB};
-constexpr Bitboard PawnBB[2]  = {HalfBB[BLACK] | ((Rank3BB | Rank4BB) & PawnFileBB),
-                                 HalfBB[WHITE] | ((Rank6BB | Rank5BB) & PawnFileBB)};
-
-extern uint8_t PopCnt16[1 << 16];
-extern uint8_t SquareDistance[SQUARE_NB][SQUARE_NB];
-
-extern Bitboard SquareBB[SQUARE_NB];
-extern Bitboard BetweenBB[SQUARE_NB][SQUARE_NB];
-extern Bitboard LineBB[SQUARE_NB][SQUARE_NB];
-extern Bitboard PseudoAttacks[PIECE_TYPE_NB + 2][SQUARE_NB];
-
-int popcount(Bitboard b);  // required for 128 bit pext
-
-// Magic holds all magic bitboards relevant data for a single square
-struct Magic {
-    Bitboard  mask;
-    Bitboard* attacks;
-    unsigned  shift;
-    IF_NOT_PEXT(Bitboard magic;)
-
-    // Compute the attack's index using the 'magic bitboards' approach
-    unsigned index(Bitboard occupied) const {
-
-#ifdef USE_PEXT
-        return unsigned(pext(occupied, mask, shift));
-#else
-        return unsigned(((occupied & mask) * magic) >> shift);
-#endif
+constexpr Bitboard BB_ONE = 1;
+constexpr Bitboard BB_ALL = (BB_ONE << NUM_SQ) - 1;
+// Square masks by table (a variable 128-bit shift costs a shld/shl/cmov sequence); valid for 0 <= s < 128.
+struct SquareTable {
+    Bitboard b[128];
+    constexpr SquareTable() : b() {
+        for (int s = 0; s < 128; ++s) b[s] = BB_ONE << s;
     }
 };
+inline constexpr SquareTable SQUARE_BB{};
+inline Bitboard sq_bb(int s) { return SQUARE_BB.b[s]; }
 
-extern Magic RookMagics[SQUARE_NB];
-extern Magic CannonMagics[SQUARE_NB];
-extern Magic BishopMagics[SQUARE_NB];
-extern Magic KnightMagics[SQUARE_NB];
-extern Magic KnightToMagics[SQUARE_NB];
-
-constexpr Bitboard square_bb(Square s) {
-    assert(is_ok(s));
-    return SquareBB[s];
+inline int popcount(Bitboard b) { return __builtin_popcountll(uint64_t(b)) + __builtin_popcountll(uint64_t(b >> 64)); }
+inline int lsb(Bitboard b) {  // b != 0
+    const uint64_t lo = uint64_t(b);
+    return lo ? __builtin_ctzll(lo) : 64 + __builtin_ctzll(uint64_t(b >> 64));
 }
-
-
-// Overloads of bitwise operators between a Bitboard and a Square for testing
-// whether a given bit is set in a bitboard, and for setting and clearing bits.
-
-constexpr Bitboard  operator&(Bitboard b, Square s) { return b & square_bb(s); }
-constexpr Bitboard  operator|(Bitboard b, Square s) { return b | square_bb(s); }
-constexpr Bitboard  operator^(Bitboard b, Square s) { return b ^ square_bb(s); }
-constexpr Bitboard& operator|=(Bitboard& b, Square s) { return b |= square_bb(s); }
-constexpr Bitboard& operator^=(Bitboard& b, Square s) { return b ^= square_bb(s); }
-
-constexpr Bitboard operator&(Square s, Bitboard b) { return b & s; }
-constexpr Bitboard operator|(Square s, Bitboard b) { return b | s; }
-constexpr Bitboard operator^(Square s, Bitboard b) { return b ^ s; }
-
-constexpr Bitboard operator|(Square s1, Square s2) { return square_bb(s1) | s2; }
-
-constexpr bool more_than_one(Bitboard b) { return bool(b & (b - 1)); }
-
-
-// rank_bb() and file_bb() return a bitboard representing all the squares on
-// the given file or rank.
-
-constexpr Bitboard rank_bb(Rank r) { return Rank0BB << (FILE_NB * r); }
-
-constexpr Bitboard rank_bb(Square s) { return rank_bb(rank_of(s)); }
-
-constexpr Bitboard file_bb(File f) { return FileABB << std::uint8_t(f); }
-
-constexpr Bitboard file_bb(Square s) { return file_bb(file_of(s)); }
-
-
-// Moves a bitboard one or two steps as specified by the direction D
-template<Direction D>
-constexpr Bitboard shift(Bitboard b) {
-    return D == NORTH         ? (b & ~Rank9BB) << std::uint8_t(NORTH)
-         : D == SOUTH         ? b >> std::uint8_t(NORTH)
-         : D == NORTH + NORTH ? (b & ~Rank9BB & ~Rank8BB) << std::uint8_t(NORTH + NORTH)
-         : D == SOUTH + SOUTH ? b >> std::uint8_t(NORTH + NORTH)
-         : D == EAST          ? (b & ~FileIBB) << std::uint8_t(EAST)
-         : D == WEST          ? (b & ~FileABB) >> std::uint8_t(EAST)
-         : D == NORTH_EAST    ? (b & ~FileIBB) << std::uint8_t(NORTH_EAST)
-         : D == NORTH_WEST    ? (b & ~FileABB) << std::uint8_t(NORTH_WEST)
-         : D == SOUTH_EAST    ? (b & ~FileIBB) >> std::uint8_t(NORTH_WEST)
-         : D == SOUTH_WEST    ? (b & ~FileABB) >> std::uint8_t(NORTH_EAST)
-                              : Bitboard(0);
+inline int msb(Bitboard b) {  // b != 0
+    const uint64_t hi = uint64_t(b >> 64);
+    return hi ? 127 - __builtin_clzll(hi) : 63 - __builtin_clzll(uint64_t(b));
 }
-
-
-// Returns the squares attacked by pawns of the given color
-// from the squares in the given bitboard.
-template<Color C>
-constexpr Bitboard pawn_attacks_bb(Square s) {
-    Bitboard b      = square_bb(s);
-    Bitboard attack = shift < C == WHITE ? NORTH : SOUTH > (b);
-    if ((C == WHITE && rank_of(s) > RANK_4) || (C == BLACK && rank_of(s) < RANK_5))
-        attack |= shift<WEST>(b) | shift<EAST>(b);
-    return attack;
-}
-
-
-// Returns the squares that if there is a pawn
-// of the given color in there, it can attack the square s
-template<Color C>
-constexpr Bitboard pawn_attacks_to_bb(Square s) {
-    Bitboard b      = square_bb(s);
-    Bitboard attack = shift < C == WHITE ? SOUTH : NORTH > (b);
-    if ((C == WHITE && rank_of(s) > RANK_4) || (C == BLACK && rank_of(s) < RANK_5))
-        attack |= shift<WEST>(b) | shift<EAST>(b);
-    return attack;
-}
-
-
-// Returns a bitboard representing an entire line (from board edge
-// to board edge) that intersects the two given squares. If the given squares
-// are not on a same file/rank/diagonal, the function returns 0. For instance,
-// line_bb(SQ_C4, SQ_F7) will return a bitboard with the A2-G8 diagonal.
-inline Bitboard line_bb(Square s1, Square s2) {
-
-    assert(is_ok(s1) && is_ok(s2));
-    return LineBB[s1][s2];
-}
-
-
-// Returns a bitboard representing the squares in the semi-open
-// segment between the squares s1 and s2 (excluding s1 but including s2). If the
-// given squares are not on a same file/rank/diagonal, it returns s2. For instance,
-// between_bb(SQ_C4, SQ_F7) will return a bitboard with squares D5, E6 and F7, but
-// between_bb(SQ_E6, SQ_F8) will return a bitboard with the square F8. This trick
-// allows to generate non-king evasion moves faster: the defending piece must either
-// interpose itself to cover the check or capture the checking piece.
-inline Bitboard between_bb(Square s1, Square s2) {
-
-    assert(is_ok(s1) && is_ok(s2));
-    return BetweenBB[s1][s2];
-}
-
-
-// Returns true if the squares s1, s2 and s3 are aligned either on a
-// straight or on a diagonal line.
-inline bool aligned(Square s1, Square s2, Square s3) { return bool(line_bb(s1, s2) & s3); }
-
-
-// distance() functions return the distance between x and y, defined as the
-// number of steps for a king in x to reach y.
-
-template<typename T1 = Square>
-inline int distance(Square x, Square y);
-
-template<>
-inline int distance<File>(Square x, Square y) {
-    return std::abs(file_of(x) - file_of(y));
-}
-
-template<>
-inline int distance<Rank>(Square x, Square y) {
-    return std::abs(rank_of(x) - rank_of(y));
-}
-
-template<>
-inline int distance<Square>(Square x, Square y) {
-    return SquareDistance[x][y];
-}
-
-inline int edge_distance(File f) { return std::min(f, File(FILE_I - f)); }
-inline int edge_distance(Rank r) { return std::min(r, Rank(RANK_9 - r)); }
-
-
-// Returns the pseudo attacks of the given piece type
-// assuming an empty board.
-template<PieceType Pt>
-inline Bitboard attacks_bb(Square s, Color c = COLOR_NB) {
-
-    assert(((Pt != PAWN && Pt != PAWN_TO) || c < COLOR_NB) && (is_ok(s)));
-    if constexpr (Pt != PAWN && Pt != PAWN_TO)
-        return PseudoAttacks[Pt][s];
-    else if constexpr (Pt == PAWN)
-        return PseudoAttacks[c == WHITE ? NO_PIECE_TYPE : PAWN][s];
-    else  // if constexpr (Pt == PAWN_TO)
-        return PseudoAttacks[c == WHITE ? KNIGHT_TO : PAWN_TO][s];
-}
-
-
-// Returns the attacks by the given piece
-// assuming the board is occupied according to the passed Bitboard.
-// Sliding piece attacks do not continue passed an occupied square.
-template<PieceType Pt>
-inline Bitboard attacks_bb(Square s, Bitboard occupied) {
-
-    assert((Pt != PAWN) && (Pt != PAWN_TO) && (is_ok(s)));
-
-    switch (Pt)
-    {
-    case ROOK :
-        return RookMagics[s].attacks[RookMagics[s].index(occupied)];
-    case CANNON :
-        return CannonMagics[s].attacks[CannonMagics[s].index(occupied)];
-    case BISHOP :
-        return BishopMagics[s].attacks[BishopMagics[s].index(occupied)];
-    case KNIGHT :
-        return KnightMagics[s].attacks[KnightMagics[s].index(occupied)];
-    case KNIGHT_TO :
-        return KnightToMagics[s].attacks[KnightToMagics[s].index(occupied)];
-    default :
-        return PseudoAttacks[Pt][s];
-    }
-}
-
-// Returns the attacks by the given piece
-// assuming the board is occupied according to the passed Bitboard.
-// Sliding piece attacks do not continue passed an occupied square.
-inline Bitboard attacks_bb(PieceType pt, Square s, Bitboard occupied) {
-
-    assert((pt != PAWN) && (pt < KNIGHT_TO) && (is_ok(s)));
-
-    switch (pt)
-    {
-    case ROOK :
-        return attacks_bb<ROOK>(s, occupied);
-    case CANNON :
-        return attacks_bb<CANNON>(s, occupied);
-    case BISHOP :
-        return attacks_bb<BISHOP>(s, occupied);
-    case KNIGHT :
-        return attacks_bb<KNIGHT>(s, occupied);
-    default :
-        return PseudoAttacks[pt][s];
-    }
-}
-
-
-// Counts the number of non-zero bits in a bitboard
-
-inline int popcount(Bitboard b) {
-
-#ifndef USE_POPCNT
-
-    std::uint16_t indices[8];
-    std::memcpy(indices, &b, sizeof(b));
-    return PopCnt16[indices[0]] + PopCnt16[indices[1]] + PopCnt16[indices[2]] + PopCnt16[indices[3]]
-         + PopCnt16[indices[4]] + PopCnt16[indices[5]] + PopCnt16[indices[6]]
-         + PopCnt16[indices[7]];
-
-#elif defined(_MSC_VER)
-
-    return int(_mm_popcnt_u64(b._Word[1])) + int(_mm_popcnt_u64(b._Word[0]));
-
-#else  // Assumed gcc or compatible compiler
-
-    return __builtin_popcountll(b >> 64) + __builtin_popcountll(b);
-
-#endif
-}
-
-
-// Return the least significant bit in a non-zero bitboard
-inline Square lsb(Bitboard b) {
-    assert(b);
-
-#if defined(_MSC_VER)  // MSVC
-
-    unsigned long idx;
-    if (b._Word[0])
-    {
-        _BitScanForward64(&idx, b._Word[0]);
-        return Square(idx);
-    }
-    else
-    {
-        _BitScanForward64(&idx, b._Word[1]);
-        return Square(idx + 64);
-    }
-
-#else  // Assumed gcc or compatible compiler
-
-    if (uint64_t(b))
-        return Square(__builtin_ctzll(b));
-    return Square(__builtin_ctzll(b >> 64) + 64);
-
-#endif
-}
-
-// Returns the bitboard of the least significant
-// square of a non-zero bitboard. It is equivalent to square_bb(lsb(bb)).
-inline Bitboard least_significant_square_bb(Bitboard b) {
-    assert(b);
-    return b & -b;
-}
-
-// Finds and clears the least significant bit in a non-zero bitboard
-inline Square pop_lsb(Bitboard& b) {
-    assert(b);
-    const Square s = lsb(b);
+inline int pop_lsb(Bitboard& b) {
+    const int s = lsb(b);
     b &= b - 1;
     return s;
 }
+inline bool more_than_one(Bitboard b) { return (b & (b - 1)) != 0; }
+inline bool test(Bitboard b, int s) { return (b & SQUARE_BB.b[s]) != 0; }
+// Calls f(square) for every set bit, ascending.
+template <class F>
+inline void for_each_sq(Bitboard b, F&& f) {
+    uint64_t lo = uint64_t(b), hi = uint64_t(b >> 64);
+    while (lo) { f(__builtin_ctzll(lo)); lo &= lo - 1; }
+    while (hi) { f(64 + __builtin_ctzll(hi)); hi &= hi - 1; }
+}
 
-}  // namespace Stockfish
+namespace BB {
 
-#endif  // #ifndef BITBOARD_H_INCLUDED
+// Directions as in tables.h: NORTH = +9 (towards rank 9), SOUTH = -9, EAST = +1, WEST = -1.
+// Ray[s][d]: squares strictly beyond s along d (same squares as T.ray[s][d]).
+extern Bitboard Ray[NUM_SQ][4];
+extern Bitboard FileBB[9], RankBB[10];
+extern Bitboard Half[2];     // own half of colour c (ranks 0-4 for Red)
+extern Bitboard Palace[2];
+// Leaper geometry (no blocking): destinations from s.
+extern Bitboard HorseTo[NUM_SQ];    // = T.horseTo[s][*]
+extern Bitboard HorseFrom[NUM_SQ];  // squares from which a horse reaches s (= T.horseFrom[s][*])
+extern Bitboard ElephTo[NUM_SQ];    // = T.elephTo (symmetric: also the elephant squares that reach s)
+extern Bitboard AdvTo[NUM_SQ];      // = T.advTo (symmetric)
+extern Bitboard KingTo[NUM_SQ];     // = T.kingTo (palace steps)
+// Horse leg masks: HorseByLeg[s][i]: targets of a horse on s whose leg is the i-th orthogonal neighbour
+// (i = direction N,S,E,W); HorseAttByLeg[s][i]: horses that attack s through the i-th diagonal neighbour of s
+// (diagonals NE, NW, SE, SW) being empty. Elephant eye masks: ElephByEye[s][i] (diagonal i).
+extern Bitboard HorseByLeg[NUM_SQ][4], HorseAttByLeg[NUM_SQ][4], ElephByEye[NUM_SQ][4];
+extern int8_t OrthoNb[NUM_SQ][4], DiagNb[NUM_SQ][4];  // neighbour squares, -1 off board
+// Soldiers: SoldierTo[c][s] = targets of a colour-c soldier on s; SoldierFrom[c][s] = squares from which a
+// colour-c soldier attacks s.
+extern Bitboard SoldierTo[2][NUM_SQ], SoldierFrom[2][NUM_SQ];
+// Start squares of colour c whose face-down role is t (t = ROOK..SOLDIER), and all start squares.
+extern Bitboard DarkRoleBB[2][9], DarkStart[2];
+// Leg / eye square for a (from, to) leaper pair, 0xFF if not a horse / elephant step.
+extern uint8_t Leg[NUM_SQ][NUM_SQ], Eye[NUM_SQ][NUM_SQ];
+
+void init();  // idempotent; calls init_tables()
+
+// first / second blockers of all four rays of s in one pass (file / rank occupancy,
+// tzcnt / lzcnt), -1 if none; directions N, S, E, W as Dir. Same squares as blockers(s, d, occ, ..) for each d.
+// The file occupancy uses PEXT on the tiers where it is fast (JQ_USE_PEXT: bmi2 and up), else the exact multiply
+// gather of threats.cpp; tiers without BMI1 / LZCNT get nobmi.h's exact replacements (force-included).
+extern uint64_t FileLo[9], FileHi[9];
+extern int FileNLo[9];
+// REL[a][b]: bit 0 same file or rank, bit 1 diagonal neighbours, bit 2 Chebyshev distance <= 2
+extern uint8_t REL[NUM_SQ][NUM_SQ];
+
+inline bool ascending(int d) { return d == NORTH || d == EAST; }
+// Nearest occupied square from s along d (-1 if none).
+inline int first_blocker(int s, int d, Bitboard occ) {
+    const Bitboard m = Ray[s][d] & occ;
+    if (!m) return -1;
+    return ascending(d) ? lsb(m) : msb(m);
+}
+// First (f1) and second (f2) occupied squares from s along d (-1 if none).
+inline void blockers(int s, int d, Bitboard occ, int& f1, int& f2) {
+    Bitboard m = Ray[s][d] & occ;
+    if (!m) { f1 = f2 = -1; return; }
+    if (ascending(d)) {
+        f1 = lsb(m);
+        m &= m - 1;
+        f2 = m ? lsb(m) : -1;
+    } else {
+        f1 = msb(m);
+        m ^= sq_bb(f1);
+        f2 = m ? msb(m) : -1;
+    }
+}
+
+inline void scan4(int s, Bitboard occ, int (&f1)[4], int (&f2)[4]) {
+    const int f = file_of(s), r = rank_of(s);
+    const uint32_t ro = uint32_t(occ >> (9 * r)) & 0x1FFu & ~(1u << f);
+#if defined(JQ_USE_PEXT)
+    const uint64_t lo = uint64_t(occ), hi = uint64_t(occ >> 64);
+    const uint32_t fo = (uint32_t(_pext_u64(lo, FileLo[f])) | (uint32_t(_pext_u64(hi, FileHi[f])) << FileNLo[f])) & ~(1u << r);
+#else  // same bits by one multiply: file f = bits f + 9 i of occ; i < 8 in the low word, 8 and 9 above
+    const Bitboard sh = occ >> f;
+    const uint64_t l8 = ((uint64_t(sh) & 0x8040201008040201ull) * 0x0101010101010101ull) >> 56;
+    const uint64_t h = uint64_t(sh >> 64);
+    const uint32_t fo = (uint32_t(l8) | uint32_t((h >> 8) & 1) << 8 | uint32_t((h >> 17) & 1) << 9) & ~(1u << r);
+#endif
+    {
+        uint32_t u = fo >> (r + 1);
+        const int t1 = int(_tzcnt_u32(u)); u = _blsr_u32(u); const int t2 = int(_tzcnt_u32(u));
+        f1[NORTH] = t1 < 32 ? (r + 1 + t1) * 9 + f : -1; f2[NORTH] = t2 < 32 ? (r + 1 + t2) * 9 + f : -1;
+        const uint32_t dn = fo & ((1u << r) - 1);
+        const int d1 = 31 - int(_lzcnt_u32(dn)); const int d2 = 31 - int(_lzcnt_u32(_bzhi_u32(dn, uint32_t(d1) & 255u)));
+        f1[SOUTH] = d1 >= 0 ? d1 * 9 + f : -1; f2[SOUTH] = d2 >= 0 ? d2 * 9 + f : -1;
+    }
+    {
+        uint32_t u = ro >> (f + 1);
+        const int t1 = int(_tzcnt_u32(u)); u = _blsr_u32(u); const int t2 = int(_tzcnt_u32(u));
+        f1[EAST] = t1 < 32 ? 9 * r + f + 1 + t1 : -1; f2[EAST] = t2 < 32 ? 9 * r + f + 1 + t2 : -1;
+        const uint32_t dn = ro & ((1u << f) - 1);
+        const int d1 = 31 - int(_lzcnt_u32(dn)); const int d2 = 31 - int(_lzcnt_u32(_bzhi_u32(dn, uint32_t(d1) & 255u)));
+        f1[WEST] = d1 >= 0 ? 9 * r + d1 : -1; f2[WEST] = d2 >= 0 ? 9 * r + d2 : -1;
+    }
+}
+
+// Pikafish-style attack sets (computed from the rays; used by attackers_to-style queries and by the att
+// threat prototype). rook_attacks: empty squares up to and including the first blocker on each ray;
+// cannon_attacks: the second blocker on each ray (capture targets); cannon quiet moves = rook_attacks & ~occ.
+inline Bitboard rook_attacks(int s, Bitboard occ) {
+    Bitboard a = 0;
+    for (int d = 0; d < 4; ++d) {
+        const int b = first_blocker(s, d, occ);
+        a |= b < 0 ? Ray[s][d] : Ray[s][d] & ~Ray[b][d];
+    }
+    return a;
+}
+inline Bitboard cannon_attacks(int s, Bitboard occ) {
+    Bitboard a = 0;
+    for (int d = 0; d < 4; ++d) {
+        int f1, f2;
+        blockers(s, d, occ, f1, f2);
+        if (f2 >= 0) a |= sq_bb(f2);
+    }
+    return a;
+}
+inline Bitboard horse_attacks(int s, Bitboard occ) {
+    Bitboard a = 0;
+    for (int i = 0; i < 4; ++i)
+        if (OrthoNb[s][i] >= 0 && !test(occ, OrthoNb[s][i])) a |= HorseByLeg[s][i];
+    return a;
+}
+// Squares holding (any) piece from which a horse would attack s given occupancy occ (legs checked).
+inline Bitboard horse_attackers_geom(int s, Bitboard occ) {
+    Bitboard a = 0;
+    for (int i = 0; i < 4; ++i)
+        if (DiagNb[s][i] >= 0 && !test(occ, DiagNb[s][i])) a |= HorseAttByLeg[s][i];
+    return a;
+}
+inline Bitboard elephant_attacks(int s, Bitboard occ) {
+    Bitboard a = 0;
+    for (int i = 0; i < 4; ++i)
+        if (DiagNb[s][i] >= 0 && !test(occ, DiagNb[s][i])) a |= ElephByEye[s][i];
+    return a;
+}
+
+}  // namespace BB
+}  // namespace jq

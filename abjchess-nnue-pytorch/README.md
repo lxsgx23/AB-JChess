@@ -1,51 +1,54 @@
-# AB-JChess PyTorch trainer
+# ABJchess 网络训练器
 
-This directory contains the v11 feature encoder, model, native data loader,
-distributed training helpers, checkpoint validation, and NNUE package exporter.
+训练 ABJchess 使用的 HNN 小网络（文件格式 JQHNNUE1）的 PyTorch 训练器，是训练 `abjchess-20261030.nnue`
+所用的训练器版本（仅移除了内部注释，代码未改动）。
 
-## Environment
+## 文件
 
-Use Python 3.9 or newer and install the required packages:
+| 文件 | 说明 |
+|---|---|
+| `train_hnn.py` | HNN 小网络训练主程序（king-bucket 棋子-位置特征 + 暗子池阈值特征，ABJ 风格网络头，导出 `.hnn`） |
+| `train_snn.py` | 教师网络（ABJNNUE 大网）读取、特征与公用训练组件（`train_hnn.py` 引用） |
+| `train.py` | 训练记录（112 字节 TrainRecord）读取、流式加载等公用函数（来自 jqe，MIT） |
+| `snn_ref.py` / `hnn_ref.py` | 与引擎整数推理逐位一致的 numpy 参考实现 |
+| `jqt1_ref.py` / `jqt1_torch.py` | 可选的威胁特征（`--att-width`，默认关闭；发布的小网未使用） |
+| `sk_scheme.py` | 可选的 layer-stack 选择方案（`--stack-scheme sk1`） |
 
-```powershell
-python -m pip install -r requirements.txt
+## 环境
+
+Python 3.10+，带 CUDA 的 PyTorch，NumPy：
+
+```sh
+pip install -r requirements.txt
 ```
 
-Build the native loader after providing the JQv4 common reader through
-`JQV4_COMMON_ROOT` when it is outside the source tree:
+## 用法
 
-```powershell
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
-  -DJQV4_COMMON_ROOT=<path-to-jieqi_v4_common>
-cmake --build build --config Release
-```
+1. **生成训练数据**：用引擎的 `selfplay` 命令自对弈，输出 112 字节/条的 TrainRecord 二进制文件，例如
 
-## Train
+   ```sh
+   ./abjchess selfplay games 1000 nodes 5000 threads 8 out data.bin
+   ```
 
-`train_v11.py` accepts JQv4 manifests or supported binary streams. Select one
-of the v11 feature names and provide training and validation inputs:
+   （其他参数：`depth`、`seed`、`random`、`hash`、`maxply`、`evalfile` 等，见 `abjchess/src/selfplay.cpp`。）
+   另外准备一份不参与训练的数据作为验证集。
 
-```powershell
-python .\train_v11.py <train-data> <validation-data> `
-  --features HalfKAv2_hm_jieqi_v11^ --gpus 1
-```
+2. **训练**：
 
-Keep checkpoints, logs, manifests, and training data outside this source
-directory.
+   ```sh
+   python3 train_hnn.py data1.bin data2.bin ... --val-file val.bin --teacher TEACHER.nnue --out runs/mynet
+   ```
 
-## Export
+   - `--teacher`（必填）：ABJNNUE 格式的教师网络；目标为 `wt*教师值 + ws*搜索分 + wr*对局结果`（在胜率空间，权重由 `--wt/--ws/--wr` 指定）。
+   - 网络结构：`--width`（FT 宽度）、`--kb-scheme`、`--l1/--l2`、`--stack-scheme`、`--factor`。
+   - 训练过程：`--epochs`、`--lr`、`--batch`、`--qat-from`、`--stream N`（数据大于内存时分块流式读取）等，完整列表见 `python3 train_hnn.py -h`。
 
-Export a v11 checkpoint with the matching feature name and probability tables:
+3. **使用结果**：`runs/mynet/best.hnn`（或 `last.hnn`）可直接在引擎中 `setoption name EvalFile value .../best.hnn`，
+   或用 `abjchess/tools/jqnz_tool z best.hnn mynet.nnue` 压缩。
 
-```powershell
-python .\serialize_v11.py <checkpoint> <output.nnue> `
-  --features HalfKAv2_hm_jieqi_v11^ `
-  --probability-score-to-mass <score-to-mass.i32le> `
-  --probability-mass-to-score <mass-to-score.i32le>
-```
+## 许可证与致谢
 
-The resulting package is accepted by the engine when supplied through UCI:
-
-```text
-setoption name EvalFile value C:\path\to\output.nnue
-```
+训练器以 GNU GPL v3 发布（仓库根目录 `LICENSE`）。网络结构为自研，设计上参考了 jqe
+（https://github.com/devinokeefe/jieqi ，Copyright (c) 2026 Devin O'Keefe，MIT）；`train.py` 为 jqe 原文件，
+`train_hnn.py`、`train_snn.py` 沿用了其中部分数据读取代码，MIT 声明见 `LICENSE-jqe-MIT.txt`。感谢 Devin O'Keefe。
+详见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。
