@@ -50,6 +50,11 @@ JOBS=4 src/isa/build_universal.sh linux out-linux
 
 见 [abjchess-nnue-pytorch/README.md](abjchess-nnue-pytorch/README.md)。
 
+## 排行榜
+
+<img width="2048" height="1152" alt="揭棋排行榜20261030" src="https://github.com/user-attachments/assets/4e215549-4c56-4257-a12b-5f91bbb0b4d3" />
+
+
 ## 致谢
 
 - [Pikafish](https://github.com/official-pikafish/Pikafish) 与 [Stockfish](https://github.com/official-stockfish/Stockfish)：
